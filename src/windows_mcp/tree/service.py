@@ -26,7 +26,6 @@ from windows_mcp.tree.views import (
 )
 from windows_mcp.tree.cache_utils import CacheRequestFactory, CachedControlHelper
 from windows_mcp.tree.utils import random_point_within_bounding_box
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any
 from time import time
 import logging
@@ -134,53 +133,35 @@ class Tree:
     ) -> tuple[list[TreeElementNode], list[ScrollElementNode], list[TextElementNode]]:
         interactive_nodes, scrollable_nodes, dom_informative_nodes = [], [], []
 
-        # Pre-calculate browser status in main thread to pass simple types to workers
-        task_inputs = []
+        # Sequential processing to avoid COM apartment threading deadlock
+        # (ThreadPoolExecutor + STA workers + main-thread COM = deadlock)
         for handle in windows_handles:
             is_browser = False
             try:
-                # Use temporary control for property check in main thread
-                # This is safe as we don't pass this specific COM object to the thread
                 temp_node = ControlFromHandle(handle)
                 if active_window_flag and temp_node.ClassName == "Progman":
                     continue
                 is_browser = self.desktop.is_window_browser(temp_node)
             except Exception:
                 pass
-            task_inputs.append((handle, is_browser))
 
-        with ThreadPoolExecutor() as executor:
-            retry_counts = {handle: 0 for handle in windows_handles}
-            future_to_handle = {
-                executor.submit(self.get_nodes, handle, is_browser, use_dom): handle
-                for handle, is_browser in task_inputs
-            }
-            while future_to_handle:  # keep running until no pending futures
-                for future in as_completed(list(future_to_handle)):
-                    handle = future_to_handle.pop(future)  # remove completed future
-                    try:
-                        result = future.result()
-                        if result:
-                            element_nodes, scroll_nodes, info_nodes = result
-                            interactive_nodes.extend(element_nodes)
-                            scrollable_nodes.extend(scroll_nodes)
-                            dom_informative_nodes.extend(info_nodes)
-                    except Exception as e:
-                        retry_counts[handle] += 1
-                        logger.debug(
-                            f"Error in processing handle {handle}, retry attempt {retry_counts[handle]}\nError: {e}"
-                        )
-                        if retry_counts[handle] < THREAD_MAX_RETRIES:
-                            # Need to find is_browser again for retry
-                            is_browser = next((ib for h, ib in task_inputs if h == handle), False)
-                            new_future = executor.submit(
-                                self.get_nodes, handle, is_browser, use_dom
-                            )
-                            future_to_handle[new_future] = handle
-                        else:
-                            logger.error(
-                                f"Task failed completely for handle {handle} after {THREAD_MAX_RETRIES} retries"
-                            )
+            for attempt in range(THREAD_MAX_RETRIES + 1):
+                try:
+                    result = self.get_nodes(handle, is_browser, use_dom)
+                    if result:
+                        element_nodes, scroll_nodes, info_nodes = result
+                        interactive_nodes.extend(element_nodes)
+                        scrollable_nodes.extend(scroll_nodes)
+                        dom_informative_nodes.extend(info_nodes)
+                    break
+                except Exception as e:
+                    logger.debug(
+                        f"Error processing handle {handle}, attempt {attempt + 1}/{THREAD_MAX_RETRIES + 1}: {e}"
+                    )
+                    if attempt >= THREAD_MAX_RETRIES:
+                        logger.error(f"Task failed for handle {handle} after {THREAD_MAX_RETRIES + 1} retries")
+                        break
+
         return interactive_nodes, scrollable_nodes, dom_informative_nodes
 
     def iou_bounding_box(
