@@ -13,7 +13,7 @@ from locale import getpreferredencoding
 from contextlib import contextmanager
 from typing import Literal
 from markdownify import markdownify
-from thefuzz import process
+from fuzzywuzzy import process
 from time import sleep, time
 from psutil import Process
 import win32process
@@ -23,12 +23,13 @@ import win32con
 import requests
 import logging
 import base64
+import random
 import ctypes
+import shutil
 import csv
 import re
 import os
 import io
-import random
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -216,7 +217,9 @@ class Desktop:
 
     def execute_command(self, command: str, timeout: int = 10) -> tuple[str, int]:
         try:
-            encoded = base64.b64encode(command.encode("utf-16le")).decode("ascii")
+            # Set console encoding to UTF-8 for native executable outputs
+            utf8_command = f"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {command}"
+            encoded = base64.b64encode(utf8_command.encode("utf-16le")).decode("ascii")
             env = os.environ.copy()
             # Fix PATHEXT if clobbered by venv activation (uv strips it to .CPL)
             if ".EXE" not in env.get("PATHEXT", ""):
@@ -229,15 +232,18 @@ class Desktop:
                         env["PATHEXT"] = winreg.QueryValueEx(key, "PATHEXT")[0]
                 except Exception:
                     env["PATHEXT"] = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.CPL;.PY;.PYW"
+
+            shell = "pwsh" if shutil.which("pwsh") else "powershell"
+                
+            args = [shell, "-NoProfile"]
+            # Only older Windows PowerShell (5.1) uses -OutputFormat Text successfully here 
+            shell_name = os.path.basename(shell).lower().replace(".exe", "")
+            if shell_name == "powershell":
+                args.extend(["-OutputFormat", "Text"])
+            args.extend(["-EncodedCommand", encoded])
+            
             result = subprocess.run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-OutputFormat",
-                    "Text",
-                    "-EncodedCommand",
-                    encoded,
-                ],
+                args,
                 capture_output=True,  # No errors='ignore' - let subprocess return bytes
                 timeout=timeout,
                 cwd=os.path.expanduser(path="~"),
@@ -247,9 +253,9 @@ class Desktop:
             stdout = result.stdout
             stderr = result.stderr
             if isinstance(stdout, bytes):
-                stdout = stdout.decode(self.encoding, errors="ignore")
+                stdout = stdout.decode("utf-8", errors="replace")
             if isinstance(stderr, bytes):
-                stderr = stderr.decode(self.encoding, errors="ignore")
+                stderr = stderr.decode("utf-8", errors="replace")
             return (stdout or stderr, result.returncode)
         except subprocess.TimeoutExpired:
             return ("Command execution timed out", 1)
