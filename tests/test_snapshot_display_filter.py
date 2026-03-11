@@ -1,4 +1,4 @@
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from PIL import Image
@@ -166,3 +166,41 @@ class TestDisplayFiltering:
         assert state.screenshot_size.to_string() == "(1920,1080)"
         assert state.screenshot_region.xyxy_to_string() == "(1920,0,3840,1080)"
         assert state.screenshot_displays == [1]
+
+    def test_get_state_skips_tree_capture_when_use_ui_tree_false(self, desktop):
+        desktop.tree = MagicMock()
+        desktop.tree.screen_box = make_box(0, 0, 1920, 1080)
+        desktop.get_controls_handles = MagicMock(return_value={1})
+        active_window = Window(
+            name="Browser",
+            is_browser=True,
+            depth=0,
+            status=Status.NORMAL,
+            bounding_box=make_box(100, 100, 700, 500),
+            handle=1,
+            process_id=11,
+        )
+        desktop.get_windows = MagicMock(return_value=([active_window], {1}))
+        desktop.get_active_window = MagicMock(return_value=active_window)
+        desktop.get_cursor_location = MagicMock(return_value=(250, 180))
+        desktop.get_screenshot = MagicMock(return_value=Image.new("RGB", (800, 600), "white"))
+
+        with patch("windows_mcp.desktop.service.get_current_desktop", return_value={"name": "Desktop 1"}):
+            with patch("windows_mcp.desktop.service.get_all_desktops", return_value=[{"name": "Desktop 1"}]):
+                state = desktop.get_state(
+                    use_vision=True,
+                    use_annotation=False,
+                    use_ui_tree=False,
+                )
+
+        desktop.tree.get_state.assert_not_called()
+        assert state.tree_state.root_node.bounding_box == desktop.tree.screen_box
+        assert state.tree_state.interactive_nodes == []
+        assert state.tree_state.scrollable_nodes == []
+        assert state.screenshot_size.to_string() == "(800,600)"
+
+    def test_get_state_rejects_dom_without_ui_tree(self, desktop):
+        desktop.tree = MagicMock()
+
+        with pytest.raises(ValueError, match="use_dom=True requires use_ui_tree=True"):
+            desktop.get_state(use_dom=True, use_ui_tree=False)

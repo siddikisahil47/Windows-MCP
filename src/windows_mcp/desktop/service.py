@@ -5,7 +5,7 @@ from windows_mcp.vdm.core import (
     is_window_on_current_desktop,
 )
 from windows_mcp.desktop.views import DesktopState, Window, Browser, Status, Size
-from windows_mcp.tree.views import BoundingBox, TreeElementNode
+from windows_mcp.tree.views import BoundingBox, TreeElementNode, TreeState
 from concurrent.futures import ThreadPoolExecutor
 from PIL import ImageGrab, ImageFont, ImageDraw, Image
 from windows_mcp.tree.service import Tree
@@ -77,6 +77,7 @@ class Desktop:
         use_annotation: bool | str = True,
         use_vision: bool | str = False,
         use_dom: bool | str = False,
+        use_ui_tree: bool | str = True,
         as_bytes: bool | str = False,
         scale: float = 1.0,
         grid_lines: tuple[int, int] | None = None,
@@ -90,10 +91,17 @@ class Desktop:
             isinstance(use_vision, str) and use_vision.lower() == "true"
         )
         use_dom = use_dom is True or (isinstance(use_dom, str) and use_dom.lower() == "true")
+        use_ui_tree = use_ui_tree is True or (
+            isinstance(use_ui_tree, str) and use_ui_tree.lower() == "true"
+        )
         as_bytes = as_bytes is True or (isinstance(as_bytes, str) and as_bytes.lower() == "true")
+
+        if use_dom and not use_ui_tree:
+            raise ValueError("use_dom=True requires use_ui_tree=True")
 
         start_time = time()
         capture_rect = self.get_display_union_rect(display_indices) if display_indices else None
+        screenshot_region = self._rect_to_bounding_box(capture_rect) if capture_rect else None
 
         controls_handles = self.get_controls_handles()  # Taskbar,Program Manager,Apps, Dialogs
         windows, windows_handles = self.get_windows(controls_handles=controls_handles)  # Apps
@@ -118,18 +126,30 @@ class Desktop:
         logger.debug(f"Active window: {active_window or 'No Active Window Found'}")
         logger.debug(f"Windows: {windows}")
 
-        # Preparing handles for Tree
-        other_windows_handles = list(controls_handles - windows_handles)
+        if use_ui_tree:
+            other_windows_handles = list(controls_handles - windows_handles)
+            tree_state = self.tree.get_state(
+                active_window_handle, other_windows_handles, use_dom=use_dom
+            )
+        else:
+            root_box = screenshot_region or self.tree.screen_box
+            tree_state = TreeState(
+                status=True,
+                root_node=TreeElementNode(
+                    name="Desktop",
+                    control_type="PaneControl",
+                    bounding_box=root_box,
+                    center=root_box.get_center(),
+                    window_name="Desktop",
+                    metadata={},
+                ),
+            )
 
-        tree_state = self.tree.get_state(
-            active_window_handle, other_windows_handles, use_dom=use_dom
-        )
-
-        screenshot_region = self._rect_to_bounding_box(capture_rect) if capture_rect else None
         if screenshot_region:
             active_window = self._filter_window_to_region(active_window, screenshot_region)
             windows = self._filter_windows_to_region(windows, screenshot_region)
-            tree_state = self._filter_tree_state_to_region(tree_state, screenshot_region)
+            if use_ui_tree:
+                tree_state = self._filter_tree_state_to_region(tree_state, screenshot_region)
             if cursor_position and not self._point_in_region(cursor_position, screenshot_region):
                 cursor_position = None
 
