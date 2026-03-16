@@ -7,8 +7,9 @@ from windows_mcp.vdm.core import (
 from windows_mcp.desktop.views import DesktopState, Window, Browser, Status, Size
 from windows_mcp.tree.views import BoundingBox, TreeElementNode, TreeState
 from concurrent.futures import ThreadPoolExecutor
-from PIL import ImageGrab, ImageFont, ImageDraw, Image
+from PIL import ImageFont, ImageDraw, Image
 from windows_mcp.tree.service import Tree
+from windows_mcp.desktop import screenshot as screenshot_capture
 from locale import getpreferredencoding
 from contextlib import contextmanager
 from typing import Literal
@@ -36,10 +37,8 @@ logger.setLevel(logging.INFO)
 
 import windows_mcp.uia as uia  # noqa: E402
 
-try:
-    import dxcam
-except ImportError:
-    dxcam = None
+dxcam = screenshot_capture.dxcam
+mss = screenshot_capture.mss
 
 # Key name aliases for shortcut keys that differ from UIA SpecialKeyNames
 _KEY_ALIASES = {
@@ -85,79 +84,29 @@ class Desktop:
 
     @staticmethod
     def _get_screenshot_backend() -> str:
-        value = os.getenv("WINDOWS_MCP_SCREENSHOT_BACKEND", "auto")
-        normalized = value.strip().lower()
-        if normalized in {"auto", "pillow", "dxcam"}:
-            return normalized
-        logger.warning(
-            "Unknown screenshot backend '%s'; falling back to auto",
-            value,
-        )
-        return "auto"
+        return screenshot_capture.get_screenshot_backend()
 
     def _resolve_dxcam_region(
         self, capture_rect: uia.Rect | None
     ) -> tuple[int, tuple[int, int, int, int] | None] | None:
-        if dxcam is None or capture_rect is None:
+        if dxcam is None:
             return None
-
-        monitor_rects = uia.GetMonitorsRect()
-        for output_idx, monitor_rect in enumerate(monitor_rects):
-            if (
-                monitor_rect.left <= capture_rect.left
-                and monitor_rect.top <= capture_rect.top
-                and monitor_rect.right >= capture_rect.right
-                and monitor_rect.bottom >= capture_rect.bottom
-            ):
-                if monitor_rect == capture_rect:
-                    return output_idx, None
-                return output_idx, (
-                    capture_rect.left - monitor_rect.left,
-                    capture_rect.top - monitor_rect.top,
-                    capture_rect.right - monitor_rect.left,
-                    capture_rect.bottom - monitor_rect.top,
-                )
-        return None
+        return screenshot_capture.resolve_dxcam_region(capture_rect, uia.GetMonitorsRect)
 
     def _get_dxcam_camera(self, output_idx: int):
-        camera = self._dxcam_cameras.get(output_idx)
-        if camera is None:
-            camera = dxcam.create(output_idx=output_idx, processor_backend="numpy")
-            self._dxcam_cameras[output_idx] = camera
-        return camera
+        # Keep method for backward compatibility with tests and callers.
+        return screenshot_capture.get_dxcam_camera(output_idx, self._dxcam_cameras, dxcam_module=dxcam)
 
     def _capture_with_dxcam(self, capture_rect: uia.Rect) -> Image.Image:
-        resolved = self._resolve_dxcam_region(capture_rect)
-        if resolved is None:
-            raise ValueError("DXGI capture supports only regions fully contained within one display")
-
-        output_idx, region = resolved
-        camera = self._get_dxcam_camera(output_idx)
-        frame = camera.grab(region=region, copy=True, new_frame_only=False)
-        if frame is None:
-            raise RuntimeError("DXGI capture returned no frame")
-        return Image.fromarray(frame)
+        return screenshot_capture.capture_with_dxcam(
+            capture_rect,
+            uia.GetMonitorsRect,
+            self._dxcam_cameras,
+            dxcam_module=dxcam,
+        )
 
     def _capture_with_pillow(self, capture_rect: uia.Rect | None = None) -> Image.Image:
-        grab_kwargs = {"all_screens": True}
-        if capture_rect is not None:
-            grab_kwargs["bbox"] = (
-                capture_rect.left,
-                capture_rect.top,
-                capture_rect.right,
-                capture_rect.bottom,
-            )
-        try:
-            screenshot = ImageGrab.grab(**grab_kwargs)
-        except Exception:
-            if capture_rect is not None:
-                logger.warning(
-                    "Failed to capture selected region directly, falling back to virtual screen crop"
-                )
-                return self._crop_screenshot(ImageGrab.grab(all_screens=True), capture_rect)
-            logger.warning("Failed to capture virtual screen, using primary screen")
-            screenshot = ImageGrab.grab()
-        return self._crop_screenshot(screenshot, capture_rect)
+        return screenshot_capture.capture_with_pillow(capture_rect, self._crop_screenshot)
 
     def get_state(
         self,
@@ -1109,23 +1058,17 @@ class Desktop:
         )
 
     def get_screenshot(self, capture_rect: uia.Rect | None = None) -> Image.Image:
-        backend = self._get_screenshot_backend()
-        if backend in {"auto", "dxcam"} and capture_rect is not None and dxcam is not None:
-            try:
-                img = self._capture_with_dxcam(capture_rect)
-                self._last_screenshot_backend = "dxcam"
-                return img
-            except Exception:
-                logger.warning(
-                    "DXGI capture failed for region %s; falling back to Pillow",
-                    capture_rect,
-                    exc_info=backend == "dxcam",
-                )
-        elif backend == "dxcam" and dxcam is None:
-            logger.warning("DXGI capture requested but dxcam is not installed; falling back to Pillow")
-
-        self._last_screenshot_backend = "pillow"
-        return self._capture_with_pillow(capture_rect)
+        image, used_backend = screenshot_capture.capture(
+            capture_rect=capture_rect,
+            crop_screenshot=self._crop_screenshot,
+            get_monitors_rect=uia.GetMonitorsRect,
+            camera_cache=self._dxcam_cameras,
+            backend=self._get_screenshot_backend(),
+            dxcam_module=dxcam,
+            mss_module=mss,
+        )
+        self._last_screenshot_backend = used_backend
+        return image
 
     def get_annotated_screenshot(
         self,
